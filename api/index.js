@@ -1,10 +1,11 @@
 // Production default: use the current cost-efficient GPT-5.6 model unless deployment config overrides it.
 if (!process.env.OPENAI_MODEL) process.env.OPENAI_MODEL = 'gpt-5.6-luna';
 
+const crypto = require('crypto');
 const { handler, recordPayment } = require('../server');
 const { loadState, saveState } = require('../lib/persistence');
 const { verifyRazorpay, verifyStripe } = require('../lib/webhooks');
-const { createCheckoutSession } = require('../lib/stripe');
+const { createCheckoutSession, retrieveCheckoutSession } = require('../lib/stripe');
 
 function rawBody(req) {
   return new Promise((resolve, reject) => {
@@ -68,7 +69,7 @@ async function createCheckout(req, res) {
   if (!offer) return send(res, 404, { error: 'Active offer not found' });
 
   const order = {
-    id: `ord_${require('crypto').randomBytes(5).toString('hex')}`,
+    id: `ord_${crypto.randomBytes(5).toString('hex')}`,
     offerId: offer.id,
     leadId: body.leadId || null,
     customerId: body.customerId || null,
@@ -89,7 +90,7 @@ async function createCheckout(req, res) {
       description: offer.description,
       amount: minorUnitAmount(offer.price, offer.currency),
       currency: offer.currency,
-      successUrl: `${base}/?checkout=success&order=${encodeURIComponent(order.id)}`,
+      successUrl: `${base}/?checkout=success&order=${encodeURIComponent(order.id)}&session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl: `${base}/?checkout=cancelled&order=${encodeURIComponent(order.id)}`,
       customerEmail: body.email || null
     });
@@ -107,6 +108,50 @@ async function createCheckout(req, res) {
     order.updatedAt = new Date().toISOString();
     await saveState(db);
     return send(res, 502, { error: 'Stripe checkout creation failed', detail: error.message, orderId: order.id });
+  }
+}
+
+async function verifyCheckoutReturn(req, res) {
+  if (req.method !== 'GET') return send(res, 405, { error: 'GET required' });
+  const url = new URL(req.url, 'http://titan.local');
+  const sessionId = url.searchParams.get('session_id');
+  if (!sessionId) return send(res, 400, { error: 'session_id is required' });
+  if (!process.env.STRIPE_SECRET_KEY) return send(res, 503, { error: 'Stripe checkout is not configured' });
+
+  try {
+    const session = await retrieveCheckoutSession(sessionId);
+    const orderId = session.metadata?.titanOrderId || null;
+    const db = await loadState();
+    ensureCollections(db);
+    const order = orderId ? db.orders.find(x => x.id === orderId) : null;
+    if (!order || order.checkoutSessionId !== session.id) return send(res, 404, { error: 'TITAN order could not be reconciled to this Checkout Session' });
+
+    if (session.payment_status !== 'paid') {
+      return send(res, 200, { verified: false, paymentStatus: session.payment_status, order });
+    }
+
+    const providerEventId = `checkout:${session.id}`;
+    const existing = db.payments.find(p => p.provider === 'stripe' && p.providerEventId === providerEventId);
+    if (existing) return send(res, 200, { verified: true, duplicate: true, payment: existing, order });
+
+    const payment = {
+      orderId: order.id,
+      provider: 'stripe',
+      providerEventId,
+      amount: Number(session.amount_total || 0) / 100,
+      currency: String(session.currency || order.currency || 'INR').toUpperCase(),
+      verified: true
+    };
+    const result = recordPayment(db, payment);
+    if (result.error) return send(res, result.status || 400, { error: result.error });
+    if (result.payment) {
+      markOrderPaid(db, order.id, result.payment);
+      db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'stripe.checkout.verified', aggregateId: result.payment.id, time: new Date().toISOString(), data: { sessionId: session.id } });
+      await saveState(db);
+    }
+    return send(res, 200, { verified: true, duplicate: !!result.duplicate, payment: result.payment, order });
+  } catch (error) {
+    return send(res, 502, { error: 'Stripe Checkout verification failed', detail: error.message });
   }
 }
 
@@ -177,6 +222,7 @@ async function gateway(req, res) {
   if (url.pathname === '/api/webhooks/razorpay') return paymentWebhook(req, res, 'razorpay');
   if (url.pathname === '/api/webhooks/stripe') return paymentWebhook(req, res, 'stripe');
   if (url.pathname === '/api/checkout/stripe') return createCheckout(req, res);
+  if (url.pathname === '/api/checkout/verify') return verifyCheckoutReturn(req, res);
   if (url.pathname === '/api/stripe/status' && req.method === 'GET') {
     return send(res, 200, {
       configured: !!process.env.STRIPE_SECRET_KEY,
