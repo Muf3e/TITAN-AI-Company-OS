@@ -13,7 +13,7 @@ async function run() {
     const body = new URLSearchParams(options.body);
     assert.equal(body.get('mode'), 'payment');
     assert.equal(body.get('line_items[0][price_data][currency]'), 'inr');
-    assert.equal(body.get('line_items[0][price_data][unit_amount]'), '125000');
+    assert.equal(body.get('line_items[0][price_data][unit_amount]'), '1250');
     assert.equal(body.get('metadata[titanOrderId]'), 'ord_test');
     return { ok: true, json: async () => ({ id: 'cs_test', url: 'https://checkout.stripe.test/cs_test' }) };
   };
