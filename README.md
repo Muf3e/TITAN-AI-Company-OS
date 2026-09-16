@@ -29,6 +29,7 @@ The current runtime includes:
 - Order state updated after verified payment
 - Execution traces and event logging
 - Vercel-compatible production gateway
+- Production readiness diagnostics
 - Smoke tests and GitHub Actions CI
 
 ## AI model configuration
@@ -50,16 +51,19 @@ STRIPE_WEBHOOK_SECRET=
 RAZORPAY_WEBHOOK_SECRET=
 ```
 
-`DATABASE_URL` is the production persistence gate. Local JSON mode is intended for development only.
+`DATABASE_URL` is the production persistence gate. Local JSON mode is intended for development only. TITAN now exposes `/api/readiness` to make the production requirements visible without exposing secrets.
+
+For a production deployment, PostgreSQL must be reachable before commerce can create or reconcile orders. This prevents Vercel's ephemeral local filesystem from becoming the source of truth for paid orders.
 
 `STRIPE_SECRET_KEY` enables TITAN to create and server-verify Stripe Checkout Sessions. Keep it server-side; Stripe documents secret API keys as credentials that must not be exposed in client code or public repositories. `STRIPE_WEBHOOK_SECRET` remains the preferred mechanism for asynchronous payment fulfillment because customers are not guaranteed to return to the success page.
 
 ## Commerce endpoints
 
 - `GET /api/offers` — returns active commercial offers and self-seeds the initial offer if the production database is empty.
-- `POST /api/checkout/stripe` — creates a TITAN order and Stripe Checkout Session from an active offer.
-- `GET /api/checkout/verify?session_id=...` — server-verifies a returned Checkout Session and reconciles a paid order.
+- `POST /api/checkout/stripe` — creates a TITAN order and Stripe Checkout Session from an active offer. Production checkout is locked until `DATABASE_URL` is configured.
+- `GET /api/checkout/verify?session_id=...` — server-verifies a returned Checkout Session and reconciles a paid order. Production verification is locked until `DATABASE_URL` is configured.
 - `GET /api/stripe/status` — reports whether the Stripe secret key and webhook secret are configured (never returns secrets).
+- `GET /api/readiness` — checks database reachability/schema, Stripe configuration, webhook configuration, and AI configuration. Returns `503` until the full production checklist passes.
 - `POST /api/webhooks/stripe` — accepts signed `payment_intent.succeeded`, `charge.succeeded`, and `checkout.session.completed` events.
 - `POST /api/webhooks/razorpay` — accepts signed `payment.captured` events.
 - `POST /api/payments` — blocked in the production gateway; payment state must originate from a verified provider flow.
