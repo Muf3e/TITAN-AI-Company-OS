@@ -1,9 +1,9 @@
-// Production default: use the current cost-efficient GPT-5.6 model unless deployment config overrides it.
+// Production default: use the current OpenAI API-compatible model unless deployment config overrides it.
 if (!process.env.OPENAI_MODEL) process.env.OPENAI_MODEL = 'gpt-5.6-luna';
 
 const crypto = require('crypto');
 const { handler, recordPayment } = require('../server');
-const { loadState, saveState } = require('../lib/persistence');
+const { loadState, saveState, diagnostics } = require('../lib/persistence');
 const { verifyRazorpay, verifyStripe } = require('../lib/webhooks');
 const { createCheckoutSession, retrieveCheckoutSession } = require('../lib/stripe');
 
@@ -105,6 +105,7 @@ async function listOffers(req, res) {
 
 async function createCheckout(req, res) {
   if (req.method !== 'POST') return send(res, 405, { error: 'POST required' });
+  if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) return send(res, 503, { error: 'Production commerce is locked until DATABASE_URL is configured.' });
   if (!process.env.STRIPE_SECRET_KEY) return send(res, 503, { error: 'Stripe checkout is not configured. STRIPE_SECRET_KEY is missing.' });
 
   let body;
@@ -165,6 +166,7 @@ async function verifyCheckoutReturn(req, res) {
   const sessionId = url.searchParams.get('session_id');
   if (!sessionId) return send(res, 400, { error: 'session_id is required' });
   if (!process.env.STRIPE_SECRET_KEY) return send(res, 503, { error: 'Stripe checkout is not configured' });
+  if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) return send(res, 503, { error: 'Production commerce is locked until DATABASE_URL is configured.' });
 
   try {
     const session = await retrieveCheckoutSession(sessionId);
@@ -213,6 +215,7 @@ async function paymentWebhook(req, res, provider) {
   const secret = provider === 'razorpay' ? process.env.RAZORPAY_WEBHOOK_SECRET : process.env.STRIPE_WEBHOOK_SECRET;
   const signature = provider === 'razorpay' ? req.headers['x-razorpay-signature'] : req.headers['stripe-signature'];
   if (!secret) return send(res, 503, { error: `${provider} webhook secret is not configured` });
+  if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) return send(res, 503, { error: 'Production commerce is locked until DATABASE_URL is configured.' });
   const valid = provider === 'razorpay' ? verifyRazorpay(raw, signature, secret) : verifyStripe(raw, signature, secret);
   if (!valid) return send(res, 401, { error: 'Invalid webhook signature' });
 
@@ -251,8 +254,35 @@ async function paymentWebhook(req, res, provider) {
   return send(res, 200, { received: true, duplicate: !!result.duplicate, payment: result.payment || null });
 }
 
+async function readiness(req, res) {
+  if (req.method !== 'GET') return send(res, 405, { error: 'GET required' });
+  const db = await diagnostics();
+  const stripeConfigured = !!process.env.STRIPE_SECRET_KEY;
+  const stripeWebhookConfigured = !!process.env.STRIPE_WEBHOOK_SECRET;
+  const aiConfigured = !!process.env.OPENAI_API_KEY;
+  const production = process.env.NODE_ENV === 'production';
+  const checks = {
+    database: db.reachable,
+    stripe: stripeConfigured,
+    stripeWebhook: stripeWebhookConfigured,
+    ai: aiConfigured,
+    productionPersistenceGate: !production || db.reachable
+  };
+  const ready = Object.values(checks).every(Boolean);
+  return send(res, ready ? 200 : 503, {
+    ready,
+    environment: production ? 'production' : 'development',
+    checks,
+    database: { configured: db.configured, reachable: db.reachable, mode: db.mode, schemaReady: db.schemaReady ?? false },
+    stripe: { configured: stripeConfigured, webhookConfigured: stripeWebhookConfigured },
+    ai: { configured: aiConfigured, model: process.env.OPENAI_MODEL || null },
+    note: 'AI and webhook checks are intentionally included so the endpoint reflects full production readiness; secrets are never returned.'
+  });
+}
+
 async function gateway(req, res) {
   const url = new URL(req.url, 'http://titan.local');
+  if (url.pathname === '/api/readiness') return readiness(req, res);
   if (url.pathname === '/api/webhooks/razorpay') return paymentWebhook(req, res, 'razorpay');
   if (url.pathname === '/api/webhooks/stripe') return paymentWebhook(req, res, 'stripe');
   if (url.pathname === '/api/checkout/stripe') return createCheckout(req, res);
