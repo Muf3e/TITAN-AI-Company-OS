@@ -31,7 +31,7 @@ function send(res, status, payload) {
 }
 
 function ensureCollections(db) {
-  for (const key of ['payments', 'revenue', 'events', 'traces', 'activity', 'orders', 'offers']) db[key] ||= [];
+  for (const key of ['payments', 'revenue', 'events', 'traces', 'activity', 'orders', 'offers', 'tasks']) db[key] ||= [];
 }
 
 function defaultOffer() {
@@ -61,14 +61,43 @@ function attachIntake(order, session) {
   if (Object.keys(intake).length) order.intake = intake;
 }
 
+function createFulfillmentTask(db, order) {
+  db.tasks ||= [];
+  const taskId = `fulfill:${order.id}`;
+  if (db.tasks.some(task => task.id === taskId)) return null;
+  const task = {
+    id: taskId,
+    title: `Fulfill TITAN AI Automation Audit — ${order.intake?.business_name || order.id}`,
+    agent: 'builder',
+    status: 'todo',
+    priority: 'high',
+    project: 'commerce',
+    createdAt: new Date().toISOString(),
+    source: 'verified-payment',
+    orderId: order.id,
+    intake: order.intake || {},
+    output: null
+  };
+  db.tasks.unshift(task);
+  db.events.unshift({
+    id: `evt_${Date.now().toString(36)}_fulfill`,
+    type: 'fulfillment.created',
+    aggregateId: task.id,
+    time: new Date().toISOString(),
+    data: { orderId: order.id, taskId: task.id, intake: task.intake }
+  });
+  return task;
+}
+
 function markOrderPaid(db, orderId, payment, session = null) {
-  if (!orderId) return;
+  if (!orderId) return null;
   const order = db.orders.find(x => x.id === orderId);
-  if (!order) return;
+  if (!order) return null;
   order.status = 'paid';
   order.paidAt = payment.receivedAt;
   order.paymentId = payment.id;
   if (session) attachIntake(order, session);
+  return createFulfillmentTask(db, order);
 }
 
 function minorUnitAmount(amount, currency) {
@@ -178,6 +207,8 @@ async function verifyCheckoutReturn(req, res) {
 
     attachIntake(order, session);
     if (session.payment_status !== 'paid') return send(res, 200, { verified: false, paymentStatus: session.payment_status, order });
+    if (String(session.currency || '').toUpperCase() !== String(order.currency || '').toUpperCase()) return send(res, 409, { error: 'Checkout currency does not match the TITAN order' });
+    if (majorUnitAmount(session.amount_total || 0, session.currency || order.currency) !== Number(order.amount)) return send(res, 409, { error: 'Checkout amount does not match the TITAN order' });
 
     const providerEventId = `checkout:${session.id}`;
     const existing = db.payments.find(p => p.provider === 'stripe' && p.providerEventId === providerEventId);
@@ -194,10 +225,8 @@ async function verifyCheckoutReturn(req, res) {
     const result = recordPayment(db, payment);
     if (result.error) return send(res, result.status || 400, { error: result.error });
     if (result.payment) {
-      markOrderPaid(db, order.id, result.payment, session);
-      db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'stripe.checkout.verified', aggregateId: result.payment.id, time: new Date().toISOString(), data: { sessionId: session.id, intake: order.intake || {} } });
-      await saveState(db);
-    } else {
+      const fulfillment = markOrderPaid(db, order.id, result.payment, session);
+      db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'stripe.checkout.verified', aggregateId: result.payment.id, time: new Date().toISOString(), data: { sessionId: session.id, intake: order.intake || {}, fulfillmentTaskId: fulfillment?.id || null } });
       await saveState(db);
     }
     return send(res, 200, { verified: true, duplicate: !!result.duplicate, payment: result.payment, order });
@@ -236,19 +265,24 @@ async function paymentWebhook(req, res, provider) {
     eventType = payload.type || '';
     eventId = payload.id;
     const entity = payload.data?.object;
-    if (!['payment_intent.succeeded', 'charge.succeeded', 'checkout.session.completed'].includes(eventType) || !entity) return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
-    const currency = String(entity.currency || 'usd').toLowerCase();
-    const amount = Number(entity.amount_received ?? entity.amount_total ?? entity.amount ?? 0);
-    payment = { orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null, provider: 'stripe', providerEventId: eventId, amount: majorUnitAmount(amount, currency), currency: currency.toUpperCase(), verified: true };
-    if (eventType === 'checkout.session.completed') session = entity;
+    if (eventType !== 'checkout.session.completed' || !entity) return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
+    if (entity.payment_status !== 'paid') return send(res, 200, { received: true, ignored: true, reason: 'payment_not_paid' });
+    const orderId = entity.metadata?.titanOrderId || entity.client_reference_id || null;
+    const order = orderId ? db.orders.find(x => x.id === orderId) : null;
+    if (!order || order.checkoutSessionId !== entity.id) return send(res, 409, { error: 'Stripe Checkout Session could not be reconciled to a TITAN order' });
+    const currency = String(entity.currency || '').toLowerCase();
+    const amount = majorUnitAmount(entity.amount_total || 0, currency);
+    if (currency.toUpperCase() !== String(order.currency || '').toUpperCase() || amount !== Number(order.amount)) return send(res, 409, { error: 'Stripe payment amount or currency does not match the TITAN order' });
+    payment = { orderId: order.id, provider: 'stripe', providerEventId: `checkout:${entity.id}`, amount, currency: currency.toUpperCase(), verified: true };
+    session = entity;
   }
 
   if (!eventId || !payment.amount || payment.amount <= 0) return send(res, 400, { error: 'Verified webhook did not contain a valid payment amount or event id' });
   const result = recordPayment(db, payment);
   if (result.error) return send(res, result.status || 400, { error: result.error });
   if (result.payment) {
-    markOrderPaid(db, payment.orderId, result.payment, session);
-    db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: `${provider}.${eventType}`, aggregateId: result.payment.id, time: new Date().toISOString(), data: { providerEventId: eventId, intake: session ? customFieldValues(session) : {} } });
+    const fulfillment = markOrderPaid(db, payment.orderId, result.payment, session);
+    db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: `${provider}.${eventType}`, aggregateId: result.payment.id, time: new Date().toISOString(), data: { providerEventId: eventId, paymentReference: payment.providerEventId, intake: session ? customFieldValues(session) : {}, fulfillmentTaskId: fulfillment?.id || null } });
     await saveState(db);
   }
   return send(res, 200, { received: true, duplicate: !!result.duplicate, payment: result.payment || null });
