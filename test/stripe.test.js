@@ -15,6 +15,8 @@ async function run() {
     assert.equal(body.get('line_items[0][price_data][currency]'), 'inr');
     assert.equal(body.get('line_items[0][price_data][unit_amount]'), '1250');
     assert.equal(body.get('metadata[titanOrderId]'), 'ord_test');
+    assert.equal(body.get('custom_fields[0][key]'), 'business_name');
+    assert.equal(body.get('custom_fields[2][key]'), 'main_goal');
     return { ok: true, json: async () => ({ id: 'cs_test', url: 'https://checkout.stripe.test/cs_test' }) };
   };
 
