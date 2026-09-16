@@ -46,13 +46,29 @@ function defaultOffer() {
   };
 }
 
-function markOrderPaid(db, orderId, payment) {
+function customFieldValues(session) {
+  const values = {};
+  for (const field of session?.custom_fields || []) {
+    const key = field.key;
+    const value = field.text?.value ?? field.numeric?.value ?? field.dropdown?.value ?? null;
+    if (key && value !== null) values[key] = String(value).slice(0, 1000);
+  }
+  return values;
+}
+
+function attachIntake(order, session) {
+  const intake = customFieldValues(session);
+  if (Object.keys(intake).length) order.intake = intake;
+}
+
+function markOrderPaid(db, orderId, payment, session = null) {
   if (!orderId) return;
   const order = db.orders.find(x => x.id === orderId);
   if (!order) return;
   order.status = 'paid';
   order.paidAt = payment.receivedAt;
   order.paymentId = payment.id;
+  if (session) attachIntake(order, session);
 }
 
 function minorUnitAmount(amount, currency) {
@@ -158,6 +174,7 @@ async function verifyCheckoutReturn(req, res) {
     const order = orderId ? db.orders.find(x => x.id === orderId) : null;
     if (!order || order.checkoutSessionId !== session.id) return send(res, 404, { error: 'TITAN order could not be reconciled to this Checkout Session' });
 
+    attachIntake(order, session);
     if (session.payment_status !== 'paid') return send(res, 200, { verified: false, paymentStatus: session.payment_status, order });
 
     const providerEventId = `checkout:${session.id}`;
@@ -175,8 +192,10 @@ async function verifyCheckoutReturn(req, res) {
     const result = recordPayment(db, payment);
     if (result.error) return send(res, result.status || 400, { error: result.error });
     if (result.payment) {
-      markOrderPaid(db, order.id, result.payment);
-      db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'stripe.checkout.verified', aggregateId: result.payment.id, time: new Date().toISOString(), data: { sessionId: session.id } });
+      markOrderPaid(db, order.id, result.payment, session);
+      db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'stripe.checkout.verified', aggregateId: result.payment.id, time: new Date().toISOString(), data: { sessionId: session.id, intake: order.intake || {} } });
+      await saveState(db);
+    } else {
       await saveState(db);
     }
     return send(res, 200, { verified: true, duplicate: !!result.duplicate, payment: result.payment, order });
@@ -202,6 +221,7 @@ async function paymentWebhook(req, res, provider) {
   let eventType;
   let eventId;
   let payment;
+  let session = null;
 
   if (provider === 'razorpay') {
     eventType = payload.event || '';
@@ -217,14 +237,15 @@ async function paymentWebhook(req, res, provider) {
     const currency = String(entity.currency || 'usd').toLowerCase();
     const amount = Number(entity.amount_received ?? entity.amount_total ?? entity.amount ?? 0);
     payment = { orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null, provider: 'stripe', providerEventId: eventId, amount: majorUnitAmount(amount, currency), currency: currency.toUpperCase(), verified: true };
+    if (eventType === 'checkout.session.completed') session = entity;
   }
 
   if (!eventId || !payment.amount || payment.amount <= 0) return send(res, 400, { error: 'Verified webhook did not contain a valid payment amount or event id' });
   const result = recordPayment(db, payment);
   if (result.error) return send(res, result.status || 400, { error: result.error });
   if (result.payment) {
-    markOrderPaid(db, payment.orderId, result.payment);
-    db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: `${provider}.${eventType}`, aggregateId: result.payment.id, time: new Date().toISOString(), data: { providerEventId: eventId } });
+    markOrderPaid(db, payment.orderId, result.payment, session);
+    db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: `${provider}.${eventType}`, aggregateId: result.payment.id, time: new Date().toISOString(), data: { providerEventId: eventId, intake: session ? customFieldValues(session) : {} } });
     await saveState(db);
   }
   return send(res, 200, { received: true, duplicate: !!result.duplicate, payment: result.payment || null });
