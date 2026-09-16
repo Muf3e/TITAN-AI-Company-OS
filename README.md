@@ -58,7 +58,7 @@ RAZORPAY_WEBHOOK_SECRET=
 - `POST /api/webhooks/razorpay` — accepts signed `payment.captured` events.
 - `POST /api/payments` — blocked in the production gateway; payment state must originate from a verified provider webhook.
 
-For Stripe, the Checkout Session carries `metadata[titanOrderId]`, allowing a successful payment event to be reconciled to the TITAN order. Stripe's API supports retrieving events with a secret API key, but TITAN still prefers webhook-signature verification for inbound webhook authenticity. citeturn1search1turn1search6
+For Stripe, the Checkout Session carries `metadata[titanOrderId]`, allowing a successful payment event to be reconciled to the TITAN order. Stripe's API supports retrieving events with a secret API key, but TITAN still prefers webhook-signature verification for inbound webhook authenticity.
 
 TITAN does not claim revenue until a verified payment event is received from a payment provider.
 
