@@ -21,6 +21,8 @@ The current runtime includes:
 - Initial commercial offer: **TITAN AI Automation Audit — ₹999**
 - Stripe Checkout Session creation using `STRIPE_SECRET_KEY`
 - Stripe Checkout return verification using the server-side secret key
+- Checkout intake fields for business name, website, and automation goal
+- Paid-order intake persisted for automated fulfillment
 - Direct/manual payment recording blocked in the production API
 - Signed Razorpay and Stripe webhook adapters
 - Verified payment events with duplicate protection
@@ -62,9 +64,9 @@ RAZORPAY_WEBHOOK_SECRET=
 - `POST /api/webhooks/razorpay` — accepts signed `payment.captured` events.
 - `POST /api/payments` — blocked in the production gateway; payment state must originate from a verified provider flow.
 
-Stripe documents that `payment_status=paid` means the funds are available and that a server can retrieve a Checkout Session after redirect. Stripe also states that webhooks are required for reliable fulfillment because a customer may pay successfully without reaching the success URL.
+The Stripe Checkout currently asks for three non-sensitive fulfillment inputs: business/brand name, optional website, and the customer's main automation goal. Stripe supports up to three Checkout custom fields and includes their values in the completed Checkout Session/webhook, which lets TITAN carry paid-customer context into its fulfillment engine.
 
-TITAN therefore supports the secret-key return verification path now, while keeping signed webhooks as the durable production fulfillment path.
+TITAN supports the secret-key return verification path now, while keeping signed webhooks as the durable production fulfillment path.
 
 TITAN does not claim revenue until a verified payment event or server-verified paid Checkout Session is recorded.
 
