@@ -32,6 +32,18 @@ function ensureCollections(db) {
   for (const key of ['payments', 'revenue', 'events', 'traces', 'activity', 'orders', 'offers']) db[key] ||= [];
 }
 
+function defaultOffer() {
+  return {
+    id: 'offer_ai_audit',
+    name: 'TITAN AI Automation Audit',
+    description: 'A practical AI automation blueprint that identifies repetitive work, automation opportunities, recommended tools, and a prioritized 30-day implementation plan.',
+    price: 999,
+    currency: 'INR',
+    active: true,
+    createdAt: new Date().toISOString()
+  };
+}
+
 function markOrderPaid(db, orderId, payment) {
   if (!orderId) return;
   const order = db.orders.find(x => x.id === orderId);
@@ -56,6 +68,19 @@ function requestBaseUrl(req) {
   return `${protocol}://${host}`;
 }
 
+async function listOffers(req, res) {
+  if (req.method !== 'GET') return send(res, 405, { error: 'GET required' });
+  const db = await loadState();
+  ensureCollections(db);
+  if (!db.offers.length) {
+    db.offers.push(defaultOffer());
+    db.activity ||= [];
+    db.activity.unshift({ time: new Date().toISOString().slice(0, 16).replace('T', ' '), text: 'Commercial seed offer published: TITAN AI Automation Audit — ₹999.' });
+    await saveState(db);
+  }
+  return send(res, 200, { offers: db.offers.filter(x => x.active !== false) });
+}
+
 async function createCheckout(req, res) {
   if (req.method !== 'POST') return send(res, 405, { error: 'POST required' });
   if (!process.env.STRIPE_SECRET_KEY) return send(res, 503, { error: 'Stripe checkout is not configured. STRIPE_SECRET_KEY is missing.' });
@@ -65,6 +90,7 @@ async function createCheckout(req, res) {
 
   const db = await loadState();
   ensureCollections(db);
+  if (!db.offers.length) db.offers.push(defaultOffer());
   const offer = db.offers.find(x => x.id === body.offerId && x.active !== false);
   if (!offer) return send(res, 404, { error: 'Active offer not found' });
 
@@ -126,9 +152,7 @@ async function verifyCheckoutReturn(req, res) {
     const order = orderId ? db.orders.find(x => x.id === orderId) : null;
     if (!order || order.checkoutSessionId !== session.id) return send(res, 404, { error: 'TITAN order could not be reconciled to this Checkout Session' });
 
-    if (session.payment_status !== 'paid') {
-      return send(res, 200, { verified: false, paymentStatus: session.payment_status, order });
-    }
+    if (session.payment_status !== 'paid') return send(res, 200, { verified: false, paymentStatus: session.payment_status, order });
 
     const providerEventId = `checkout:${session.id}`;
     const existing = db.payments.find(p => p.provider === 'stripe' && p.providerEventId === providerEventId);
@@ -164,9 +188,7 @@ async function paymentWebhook(req, res, provider) {
   const secret = provider === 'razorpay' ? process.env.RAZORPAY_WEBHOOK_SECRET : process.env.STRIPE_WEBHOOK_SECRET;
   const signature = provider === 'razorpay' ? req.headers['x-razorpay-signature'] : req.headers['stripe-signature'];
   if (!secret) return send(res, 503, { error: `${provider} webhook secret is not configured` });
-  const valid = provider === 'razorpay'
-    ? verifyRazorpay(raw, signature, secret)
-    : verifyStripe(raw, signature, secret);
+  const valid = provider === 'razorpay' ? verifyRazorpay(raw, signature, secret) : verifyStripe(raw, signature, secret);
   if (!valid) return send(res, 401, { error: 'Invalid webhook signature' });
 
   const db = await loadState();
@@ -180,30 +202,14 @@ async function paymentWebhook(req, res, provider) {
     eventId = payload.payload?.payment?.entity?.id || payload.id;
     const entity = payload.payload?.payment?.entity;
     if (eventType !== 'payment.captured' || !entity) return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
-    payment = {
-      orderId: entity.order_id || null,
-      provider: 'razorpay',
-      providerEventId: eventId,
-      amount: Number(entity.amount) / 100,
-      currency: String(entity.currency || 'INR').toUpperCase(),
-      verified: true
-    };
+    payment = { orderId: entity.order_id || null, provider: 'razorpay', providerEventId: eventId, amount: Number(entity.amount) / 100, currency: String(entity.currency || 'INR').toUpperCase(), verified: true };
   } else {
     eventType = payload.type || '';
     eventId = payload.id;
     const entity = payload.data?.object;
-    if (!['payment_intent.succeeded', 'charge.succeeded', 'checkout.session.completed'].includes(eventType) || !entity) {
-      return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
-    }
+    if (!['payment_intent.succeeded', 'charge.succeeded', 'checkout.session.completed'].includes(eventType) || !entity) return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
     const amount = Number(entity.amount_received ?? entity.amount_total ?? entity.amount ?? 0);
-    payment = {
-      orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null,
-      provider: 'stripe',
-      providerEventId: eventId,
-      amount: amount / 100,
-      currency: String(entity.currency || 'usd').toUpperCase(),
-      verified: true
-    };
+    payment = { orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null, provider: 'stripe', providerEventId: eventId, amount: amount / 100, currency: String(entity.currency || 'usd').toUpperCase(), verified: true };
   }
 
   if (!eventId || !payment.amount || payment.amount <= 0) return send(res, 400, { error: 'Verified webhook did not contain a valid payment amount or event id' });
@@ -223,16 +229,11 @@ async function gateway(req, res) {
   if (url.pathname === '/api/webhooks/stripe') return paymentWebhook(req, res, 'stripe');
   if (url.pathname === '/api/checkout/stripe') return createCheckout(req, res);
   if (url.pathname === '/api/checkout/verify') return verifyCheckoutReturn(req, res);
+  if (url.pathname === '/api/offers') return listOffers(req, res);
   if (url.pathname === '/api/stripe/status' && req.method === 'GET') {
-    return send(res, 200, {
-      configured: !!process.env.STRIPE_SECRET_KEY,
-      webhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
-      mode: process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ? 'live' : process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_') ? 'test' : 'unconfigured'
-    });
+    return send(res, 200, { configured: !!process.env.STRIPE_SECRET_KEY, webhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET, mode: process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ? 'live' : process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_') ? 'test' : 'unconfigured' });
   }
-  if (url.pathname === '/api/payments' && req.method === 'POST') {
-    return send(res, 403, { error: 'Direct payment recording is disabled. Use a signed payment-provider webhook.' });
-  }
+  if (url.pathname === '/api/payments' && req.method === 'POST') return send(res, 403, { error: 'Direct payment recording is disabled. Use a signed payment-provider webhook.' });
   return handler(req, res);
 }
 
