@@ -18,7 +18,9 @@ The current runtime includes:
 - Persistent PostgreSQL state when `DATABASE_URL` is configured
 - Local JSON development fallback
 - Lead → Offer → Order → Checkout → Payment → Revenue lifecycle
+- Initial commercial offer: **TITAN AI Automation Audit — ₹999**
 - Stripe Checkout Session creation using `STRIPE_SECRET_KEY`
+- Stripe Checkout return verification using the server-side secret key
 - Direct/manual payment recording blocked in the production API
 - Signed Razorpay and Stripe webhook adapters
 - Verified payment events with duplicate protection
@@ -48,18 +50,22 @@ RAZORPAY_WEBHOOK_SECRET=
 
 `DATABASE_URL` is the production persistence gate. Local JSON mode is intended for development only.
 
-`STRIPE_SECRET_KEY` enables TITAN to create Stripe Checkout Sessions. The webhook signing secret is separate: `STRIPE_WEBHOOK_SECRET` is used to authenticate Stripe webhook deliveries. TITAN intentionally does not treat a caller-provided `verified` flag as proof of payment.
+`STRIPE_SECRET_KEY` enables TITAN to create and server-verify Stripe Checkout Sessions. Keep it server-side; Stripe documents secret API keys as credentials that must not be exposed in client code or public repositories. `STRIPE_WEBHOOK_SECRET` remains the preferred mechanism for asynchronous payment fulfillment because customers are not guaranteed to return to the success page.
 
 ## Commerce endpoints
 
+- `GET /api/offers` — returns active commercial offers and self-seeds the initial offer if the production database is empty.
 - `POST /api/checkout/stripe` — creates a TITAN order and Stripe Checkout Session from an active offer.
+- `GET /api/checkout/verify?session_id=...` — server-verifies a returned Checkout Session and reconciles a paid order.
 - `GET /api/stripe/status` — reports whether the Stripe secret key and webhook secret are configured (never returns secrets).
 - `POST /api/webhooks/stripe` — accepts signed `payment_intent.succeeded`, `charge.succeeded`, and `checkout.session.completed` events.
 - `POST /api/webhooks/razorpay` — accepts signed `payment.captured` events.
-- `POST /api/payments` — blocked in the production gateway; payment state must originate from a verified provider webhook.
+- `POST /api/payments` — blocked in the production gateway; payment state must originate from a verified provider flow.
 
-For Stripe, the Checkout Session carries `metadata[titanOrderId]`, allowing a successful payment event to be reconciled to the TITAN order. Stripe's API supports retrieving events with a secret API key, but TITAN still prefers webhook-signature verification for inbound webhook authenticity.
+Stripe documents that `payment_status=paid` means the funds are available and that a server can retrieve a Checkout Session after redirect. Stripe also states that webhooks are required for reliable fulfillment because a customer may pay successfully without reaching the success URL.
 
-TITAN does not claim revenue until a verified payment event is received from a payment provider.
+TITAN therefore supports the secret-key return verification path now, while keeping signed webhooks as the durable production fulfillment path.
+
+TITAN does not claim revenue until a verified payment event or server-verified paid Checkout Session is recorded.
 
 Never commit API keys or webhook secrets to GitHub. Configure them as deployment secrets/environment variables.
