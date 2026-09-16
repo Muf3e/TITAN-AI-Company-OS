@@ -4,6 +4,7 @@ if (!process.env.OPENAI_MODEL) process.env.OPENAI_MODEL = 'gpt-5.6-luna';
 const { handler, recordPayment } = require('../server');
 const { loadState, saveState } = require('../lib/persistence');
 const { verifyRazorpay, verifyStripe } = require('../lib/webhooks');
+const { createCheckoutSession } = require('../lib/stripe');
 
 function rawBody(req) {
   return new Promise((resolve, reject) => {
@@ -27,7 +28,7 @@ function send(res, status, payload) {
 }
 
 function ensureCollections(db) {
-  for (const key of ['payments', 'revenue', 'events', 'traces', 'activity', 'orders']) db[key] ||= [];
+  for (const key of ['payments', 'revenue', 'events', 'traces', 'activity', 'orders', 'offers']) db[key] ||= [];
 }
 
 function markOrderPaid(db, orderId, payment) {
@@ -37,6 +38,76 @@ function markOrderPaid(db, orderId, payment) {
   order.status = 'paid';
   order.paidAt = payment.receivedAt;
   order.paymentId = payment.id;
+}
+
+function minorUnitAmount(amount, currency) {
+  const value = Number(amount);
+  if (!Number.isFinite(value) || value <= 0) throw new Error('Offer price must be greater than zero');
+  const zeroDecimal = new Set(['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'ugx', 'vnd', 'vuv', 'xaf', 'xof', 'xpf']);
+  return Math.round(value * (zeroDecimal.has(String(currency).toLowerCase()) ? 1 : 100));
+}
+
+function requestBaseUrl(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const protocol = forwardedProto || (process.env.NODE_ENV === 'production' ? 'https' : 'http');
+  const host = req.headers.host;
+  if (!host) throw new Error('Unable to determine application host');
+  return `${protocol}://${host}`;
+}
+
+async function createCheckout(req, res) {
+  if (req.method !== 'POST') return send(res, 405, { error: 'POST required' });
+  if (!process.env.STRIPE_SECRET_KEY) return send(res, 503, { error: 'Stripe checkout is not configured. STRIPE_SECRET_KEY is missing.' });
+
+  let body;
+  try { body = await rawBody(req); body = body ? JSON.parse(body) : {}; } catch (_) { return send(res, 400, { error: 'Invalid JSON' }); }
+
+  const db = await loadState();
+  ensureCollections(db);
+  const offer = db.offers.find(x => x.id === body.offerId && x.active !== false);
+  if (!offer) return send(res, 404, { error: 'Active offer not found' });
+
+  const order = {
+    id: `ord_${require('crypto').randomBytes(5).toString('hex')}`,
+    offerId: offer.id,
+    leadId: body.leadId || null,
+    customerId: body.customerId || null,
+    amount: Number(offer.price),
+    currency: String(offer.currency || 'INR').toUpperCase(),
+    status: 'creating_checkout',
+    createdAt: new Date().toISOString()
+  };
+  db.orders.unshift(order);
+  db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'order.created', aggregateId: order.id, time: new Date().toISOString(), data: order });
+  await saveState(db);
+
+  try {
+    const base = requestBaseUrl(req);
+    const session = await createCheckoutSession({
+      orderId: order.id,
+      name: offer.name,
+      description: offer.description,
+      amount: minorUnitAmount(offer.price, offer.currency),
+      currency: offer.currency,
+      successUrl: `${base}/?checkout=success&order=${encodeURIComponent(order.id)}`,
+      cancelUrl: `${base}/?checkout=cancelled&order=${encodeURIComponent(order.id)}`,
+      customerEmail: body.email || null
+    });
+    order.status = 'awaiting_payment';
+    order.checkoutProvider = 'stripe';
+    order.checkoutSessionId = session.id;
+    order.checkoutUrl = session.url;
+    order.updatedAt = new Date().toISOString();
+    db.events.unshift({ id: `evt_${Date.now().toString(36)}`, type: 'checkout.created', aggregateId: order.id, time: new Date().toISOString(), data: { provider: 'stripe', sessionId: session.id } });
+    await saveState(db);
+    return send(res, 201, { order, checkoutUrl: session.url, provider: 'stripe' });
+  } catch (error) {
+    order.status = 'checkout_failed';
+    order.checkoutError = error.message;
+    order.updatedAt = new Date().toISOString();
+    await saveState(db);
+    return send(res, 502, { error: 'Stripe checkout creation failed', detail: error.message, orderId: order.id });
+  }
 }
 
 async function paymentWebhook(req, res, provider) {
@@ -76,12 +147,12 @@ async function paymentWebhook(req, res, provider) {
     eventType = payload.type || '';
     eventId = payload.id;
     const entity = payload.data?.object;
-    if (!['payment_intent.succeeded', 'charge.succeeded'].includes(eventType) || !entity) {
+    if (!['payment_intent.succeeded', 'charge.succeeded', 'checkout.session.completed'].includes(eventType) || !entity) {
       return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
     }
-    const amount = Number(entity.amount_received ?? entity.amount ?? 0);
+    const amount = Number(entity.amount_received ?? entity.amount_total ?? entity.amount ?? 0);
     payment = {
-      orderId: entity.metadata?.titanOrderId || null,
+      orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null,
       provider: 'stripe',
       providerEventId: eventId,
       amount: amount / 100,
@@ -105,6 +176,14 @@ async function gateway(req, res) {
   const url = new URL(req.url, 'http://titan.local');
   if (url.pathname === '/api/webhooks/razorpay') return paymentWebhook(req, res, 'razorpay');
   if (url.pathname === '/api/webhooks/stripe') return paymentWebhook(req, res, 'stripe');
+  if (url.pathname === '/api/checkout/stripe') return createCheckout(req, res);
+  if (url.pathname === '/api/stripe/status' && req.method === 'GET') {
+    return send(res, 200, {
+      configured: !!process.env.STRIPE_SECRET_KEY,
+      webhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
+      mode: process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ? 'live' : process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_') ? 'test' : 'unconfigured'
+    });
+  }
   if (url.pathname === '/api/payments' && req.method === 'POST') {
     return send(res, 403, { error: 'Direct payment recording is disabled. Use a signed payment-provider webhook.' });
   }
