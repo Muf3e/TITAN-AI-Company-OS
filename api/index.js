@@ -7,6 +7,8 @@ const { loadState, saveState } = require('../lib/persistence');
 const { verifyRazorpay, verifyStripe } = require('../lib/webhooks');
 const { createCheckoutSession, retrieveCheckoutSession } = require('../lib/stripe');
 
+const ZERO_DECIMAL = new Set(['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'ugx', 'vnd', 'vuv', 'xaf', 'xof', 'xpf']);
+
 function rawBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -56,8 +58,12 @@ function markOrderPaid(db, orderId, payment) {
 function minorUnitAmount(amount, currency) {
   const value = Number(amount);
   if (!Number.isFinite(value) || value <= 0) throw new Error('Offer price must be greater than zero');
-  const zeroDecimal = new Set(['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'ugx', 'vnd', 'vuv', 'xaf', 'xof', 'xpf']);
-  return Math.round(value * (zeroDecimal.has(String(currency).toLowerCase()) ? 1 : 100));
+  return Math.round(value * (ZERO_DECIMAL.has(String(currency).toLowerCase()) ? 1 : 100));
+}
+
+function majorUnitAmount(amount, currency) {
+  const value = Number(amount);
+  return value / (ZERO_DECIMAL.has(String(currency).toLowerCase()) ? 1 : 100);
 }
 
 function requestBaseUrl(req) {
@@ -162,7 +168,7 @@ async function verifyCheckoutReturn(req, res) {
       orderId: order.id,
       provider: 'stripe',
       providerEventId,
-      amount: Number(session.amount_total || 0) / 100,
+      amount: majorUnitAmount(session.amount_total || 0, session.currency || order.currency),
       currency: String(session.currency || order.currency || 'INR').toUpperCase(),
       verified: true
     };
@@ -208,8 +214,9 @@ async function paymentWebhook(req, res, provider) {
     eventId = payload.id;
     const entity = payload.data?.object;
     if (!['payment_intent.succeeded', 'charge.succeeded', 'checkout.session.completed'].includes(eventType) || !entity) return send(res, 200, { received: true, ignored: true, reason: 'unsupported_event' });
+    const currency = String(entity.currency || 'usd').toLowerCase();
     const amount = Number(entity.amount_received ?? entity.amount_total ?? entity.amount ?? 0);
-    payment = { orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null, provider: 'stripe', providerEventId: eventId, amount: amount / 100, currency: String(entity.currency || 'usd').toUpperCase(), verified: true };
+    payment = { orderId: entity.metadata?.titanOrderId || entity.client_reference_id || null, provider: 'stripe', providerEventId: eventId, amount: majorUnitAmount(amount, currency), currency: currency.toUpperCase(), verified: true };
   }
 
   if (!eventId || !payment.amount || payment.amount <= 0) return send(res, 400, { error: 'Verified webhook did not contain a valid payment amount or event id' });
