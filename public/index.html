@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>TITAN — AI Company OS</title>
   <style>
-    :root{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#e8ecf1;background:#0b0f14}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 20% 0%,#17212d 0,#0b0f14 45%)}main{max-width:1100px;margin:auto;padding:48px 24px}.eyebrow{letter-spacing:.14em;text-transform:uppercase;font-size:12px;color:#8ea0b5}.hero{display:flex;justify-content:space-between;gap:24px;align-items:end;margin-bottom:28px}h1{font-size:48px;margin:8px 0}.sub{color:#aeb9c6;max-width:680px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.card{background:#111820;border:1px solid #26313d;border-radius:16px;padding:20px}.value{font-size:28px;font-weight:700;margin-top:8px}.muted{color:#8998a8;font-size:13px}button{border:0;border-radius:10px;padding:11px 16px;background:#e8ecf1;color:#0b0f14;font-weight:700;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b8c5d3}.status{display:inline-flex;align-items:center;gap:8px}.dot{width:9px;height:9px;border-radius:50%;background:#52d273}.error{color:#ff8e8e}footer{margin-top:28px;color:#687687;font-size:12px}</style>
+    :root{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#e8ecf1;background:#0b0f14}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 20% 0%,#17212d 0,#0b0f14 45%)}main{max-width:1100px;margin:auto;padding:48px 24px}.eyebrow{letter-spacing:.14em;text-transform:uppercase;font-size:12px;color:#8ea0b5}.hero{display:flex;justify-content:space-between;gap:24px;align-items:end;margin-bottom:28px}h1{font-size:48px;margin:8px 0}.sub{color:#aeb9c6;max-width:680px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.card{background:#111820;border:1px solid #26313d;border-radius:16px;padding:20px}.value{font-size:28px;font-weight:700;margin-top:8px}.muted{color:#8998a8;font-size:13px}button{border:0;border-radius:10px;padding:11px 16px;background:#e8ecf1;color:#0b0f14;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.buy{width:100%;margin-top:16px}.price{font-size:34px;font-weight:800;margin-top:10px}.status{display:inline-flex;align-items:center;gap:8px}.dot{width:9px;height:9px;border-radius:50%;background:#52d273}.error{color:#ff8e8e}.success{color:#78e08f}.store{margin-top:16px}.store p{color:#aeb9c6;line-height:1.6}.notice{margin-top:16px;padding:14px;border-radius:10px;background:#151d26;border:1px solid #26313d}.notice strong{display:block;margin-bottom:5px}pre{white-space:pre-wrap;word-break:break-word;color:#b8c5d3}footer{margin-top:28px;color:#687687;font-size:12px}</style>
 </head>
 <body>
 <main>
@@ -13,26 +13,72 @@
   <section class="grid">
     <div class="card"><div class="muted">Runtime</div><div id="runtime" class="value">Loading…</div><div id="persist" class="muted"></div></div>
     <div class="card"><div class="muted">AI Provider</div><div id="ai" class="value">Loading…</div><div id="model" class="muted"></div></div>
-    <div class="card"><div class="muted">Verified Revenue</div><div id="revenue" class="value">₹0</div><div class="muted">Only payment events count</div></div>
+    <div class="card"><div class="muted">Verified Revenue</div><div id="revenue" class="value">₹0</div><div class="muted">Only verified payment state counts</div></div>
     <div class="card"><div class="muted">Tasks</div><div id="tasks" class="value">0</div><div class="muted">Persistent execution state</div></div>
   </section>
+
+  <section class="card store">
+    <div class="eyebrow">TITAN Store</div>
+    <h2 id="offerName">Loading offer…</h2>
+    <p id="offerDescription">Preparing the first commercial offer.</p>
+    <div id="offerPrice" class="price"></div>
+    <input id="email" type="email" placeholder="Customer email (optional)" style="width:100%;padding:12px;border-radius:10px;border:1px solid #26313d;background:#0b0f14;color:#e8ecf1;margin-top:14px">
+    <button id="buy" class="buy" disabled>Loading checkout…</button>
+    <div id="commerceNotice" class="notice" style="display:none"></div>
+  </section>
+
   <section class="card" style="margin-top:16px"><div class="muted">Health</div><pre id="health">Loading…</pre></section>
-  <footer>v0.5 runtime • no fabricated revenue • production requires persistent database and configured AI provider</footer>
+  <footer>v0.7 runtime • no fabricated revenue • Stripe secret stays server-side • webhooks remain the preferred fulfillment signal</footer>
 </main>
 <script>
+let activeOffer=null;
+function notice(title,text,kind=''){
+  const el=document.getElementById('commerceNotice'); el.style.display='block'; el.className='notice '+kind; el.innerHTML='<strong>'+title+'</strong>'+text;
+}
 async function refresh(){
   try{
-    const [h,s]=await Promise.all([fetch('/api/health'),fetch('/api/state')]);
-    const health=await h.json(),state=await s.json();
+    const [h,s,o,ss]=await Promise.all([fetch('/api/health'),fetch('/api/state'),fetch('/api/offers'),fetch('/api/stripe/status')]);
+    const health=await h.json(),state=await s.json(),offers=await o.json(),stripe=await ss.json();
     document.getElementById('runtime').innerHTML='<span class="status"><span class="dot"></span>Online</span>';
     document.getElementById('persist').textContent=health.persistence+' persistence';
     document.getElementById('ai').textContent=health.ai.configured?'Configured':'Not configured';
     document.getElementById('model').textContent=health.ai.model;
     document.getElementById('revenue').textContent='₹'+Number((state.revenue||[]).reduce((a,x)=>a+Number(x.amount||0),0)).toLocaleString('en-IN');
     document.getElementById('tasks').textContent=(state.tasks||[]).length;
-    document.getElementById('health').textContent=JSON.stringify(health,null,2);
+    document.getElementById('health').textContent=JSON.stringify({...health,stripe:{configured:stripe.configured,webhookConfigured:stripe.webhookConfigured,mode:stripe.mode}},null,2);
+    activeOffer=(offers.offers||[])[0]||null;
+    if(activeOffer){
+      document.getElementById('offerName').textContent=activeOffer.name;
+      document.getElementById('offerDescription').textContent=activeOffer.description;
+      document.getElementById('offerPrice').textContent=new Intl.NumberFormat('en-IN',{style:'currency',currency:activeOffer.currency}).format(activeOffer.price);
+    }
+    const buy=document.getElementById('buy');
+    buy.disabled=!activeOffer||!stripe.configured;
+    buy.textContent=!stripe.configured?'Checkout not configured':'Buy with Stripe';
   }catch(e){document.getElementById('runtime').textContent='Unavailable';document.getElementById('runtime').className='value error';document.getElementById('health').textContent=e.message}
 }
-refresh();
+async function buy(){
+  if(!activeOffer)return;
+  const buy=document.getElementById('buy'); buy.disabled=true; buy.textContent='Creating secure checkout…';
+  try{
+    const r=await fetch('/api/checkout/stripe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({offerId:activeOffer.id,email:document.getElementById('email').value||null})});
+    const data=await r.json();
+    if(!r.ok)throw new Error(data.detail||data.error||'Checkout creation failed');
+    window.location.href=data.checkoutUrl;
+  }catch(e){notice('Checkout unavailable',e.message,'error');buy.disabled=false;buy.textContent='Try again';}
+}
+document.getElementById('buy').addEventListener('click',buy);
+async function verifyReturn(){
+  const params=new URLSearchParams(location.search),sessionId=params.get('session_id');
+  if(!sessionId)return;
+  if(params.get('checkout')==='cancelled'){notice('Checkout cancelled','No payment was recorded. You can start again whenever you are ready.');return;}
+  try{
+    const r=await fetch('/api/checkout/verify?session_id='+encodeURIComponent(sessionId));
+    const data=await r.json();
+    if(data.verified)notice('Payment verified','TITAN has verified the Stripe Checkout Session and recorded the payment against order '+data.order.id+'.','success');
+    else notice('Payment not yet verified','Stripe reports the Checkout Session as '+(data.paymentStatus||'unpaid')+'. No revenue has been claimed.');
+  }catch(e){notice('Verification pending',e.message);}
+}
+refresh().then(verifyReturn);
 </script>
 </body></html>
